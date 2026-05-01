@@ -77,6 +77,7 @@ __global__ void matmul_tiled(const float* A, const float* B, float* C, int n) {
 
     if (row < n && col < n) {
         // Task 5: write sum to C
+	C[row * n + col] = sum;
     }
 }
 
@@ -87,7 +88,8 @@ int main() {
     // Allocate host memory
     float* h_A = (float*)malloc(bytes);
     float* h_B = (float*)malloc(bytes);
-    float* h_C = (float*)malloc(bytes);
+    float* h_C_naive = (float*)malloc(bytes);
+    float* h_C_tiled = (float*)malloc(bytes);
 
     // Initialize matrices
     for (int i = 0; i < n * n; i++) {
@@ -106,9 +108,10 @@ int main() {
     cudaMemcpy(d_B, h_B, bytes, cudaMemcpyHostToDevice);
 
     // Task 2: set up block and grid dimensions
-    dim3 blockDim(16, 16);  // fill in
+    dim3 blockDim(16, 16);
     dim3 gridDim((n + blockDim.x - 1)/ blockDim.x,
-    		 (n + blockDim.y - 1) / blockDim.y); 
+                 (n + blockDim.y - 1) / blockDim.y);
+
     // Task 3: why does a naive kernel perform many redundant global memory accesses?
     /*
 	A naive kernel performs many redundant global memory accesses because it needs to perform a memory access
@@ -116,21 +119,36 @@ int main() {
 	that memory accesses will load more bytes than one single float value, allowing us to perform memory
 	accesses where all data in the access will be used for computation, instead of just retrieving one and 
 	discarding the rest. In other words, the naive kernel does not coalesce memory. 
-
 	Furthermore, the data that is retrieved from global memory is not shared between threads, meaning that each
 	thread will need to perform a memory access for computation. This is redundant, since two vertical adjacent entries in
 	C will require the same column from B, but each thread will fetch this column vector independently.  	
-
     */
 
-    // Task 8: launch naive kernel
+    // timing setup
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+
+    // Task 8: launch and time naive kernel
+    cudaEventRecord(start);
     matmul_naive<<<gridDim, blockDim>>>(d_A, d_B, d_C, n);
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+    float ms_naive = 0;
+    cudaEventElapsedTime(&ms_naive, start, stop);
+    cudaMemcpy(h_C_naive, d_C, bytes, cudaMemcpyDeviceToHost);
 
-    // Task 8: launch tiled kernel
-    matmul_tiled<<<gridDim, blockDim>>>(d_A, d_B, d_C, n);    
+    // clear d_C before tiled kernel
+    cudaMemset(d_C, 0, bytes);
 
-    // Copy result back to host
-    cudaMemcpy(h_C, d_C, bytes, cudaMemcpyDeviceToHost);
+    // Task 8: launch and time tiled kernel
+    cudaEventRecord(start);
+    matmul_tiled<<<gridDim, blockDim>>>(d_A, d_B, d_C, n);
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+    float ms_tiled = 0;
+    cudaEventElapsedTime(&ms_tiled, start, stop);
+    cudaMemcpy(h_C_tiled, d_C, bytes, cudaMemcpyDeviceToHost);
 
     // Task 9: verify correctness
     /*
@@ -139,18 +157,54 @@ int main() {
 	entry in C should be N * 1.0 * 2.0. If our matrix C does not match all entries to what we expect, then 
 	our algorithm did not run correctly. 
     */
-    // expected value per entry is N * 1.0 * 2.0 = 1024.0
     float expected = (float)n * 2.0f;
-    int errors = 0;
+    int errors_naive = 0, errors_tiled = 0, errors_match = 0;
     for (int i = 0; i < n * n; i++) {
-	    errors = (h_C[i] != expected) ? errors + 1 : errors;
+        if (h_C_naive[i] != expected) errors_naive++;
+        if (h_C_tiled[i] != expected) errors_tiled++;
+        if (h_C_naive[i] != h_C_tiled[i]) errors_match++;
     }
-    printf("Correctness: %s\n", errors == 0 ? "PASSED" : "FAILED");
+
+    printf("Naive correctness:  %s\n", errors_naive == 0 ? "PASSED" : "FAILED");
+    printf("Tiled correctness:  %s\n", errors_tiled == 0 ? "PASSED" : "FAILED");
+    printf("Naive == Tiled:     %s\n", errors_match == 0 ? "PASSED" : "FAILED");
+    printf("Matrix size:        %dx%d\n", n, n);
+    printf("Naive kernel:       %.3f ms\n", ms_naive);
+    printf("Tiled kernel:       %.3f ms\n", ms_tiled);
+    printf("Speedup:            %.2fx\n", ms_naive / ms_tiled);
 
     // Cleanup
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
     cudaFree(d_A); cudaFree(d_B); cudaFree(d_C);
-    free(h_A); free(h_B); free(h_C);
+    free(h_A); free(h_B); free(h_C_naive); free(h_C_tiled);
 
     return 0;
 }
 
+
+// PART 4 Questions
+/*
+	1. What is the advantage of shared memory over global memory in this lab?
+	The advantage of shared memory over global memory is that retrieving data from shared memory is much faster
+	than retrieving it from global memory. Overall, this cuts memory access time significantly when performing
+	the matrix computation. This is the main advantage of tiling, which takes tiles of data from global memory
+	and stores it in shared memory for the threads to enjoy fast memory access. 
+
+	2. In the naive kernel, how many floating-point multiply-add contributions are needed to compute one output entry?
+	Each entry in the output matrix C requires an inner product between two vectors of length n. Each inner product
+	requires n multiplications and n-1 additions, so 2n-1 FLOPS in total for one output entry.
+
+	3. What part of matrix multiplication is reused in the tiled kernel?
+	The tiled matrix stored in the shared memory is reused across all threads operating within the same tile.
+	Specifically, when one thread loads in one entry, that entry is reused TILE_WIDTH times, since each thread
+	on the same row of that entry requires that particular entry. Comparing this with the naive kernel, we
+	fetch for each entry in the global memory for each entry, meaning that there is no data reuse.   
+
+	4. Why is a 2D thread layout natural for matrix multiplication?
+	A 2D thread layout is natural for matrix multiplication since we matrices are 2D objects..
+	Each entry of a matrix is described by a row and column position, which motivates the use of a 2D
+	layout rather than a 1D layout (which would require a mapping to convert between each representation).
+	A 2D layout is the simplest layout to use, since the indices for row and column provide a canonical mapping.  
+
+*/
