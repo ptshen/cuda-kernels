@@ -1,7 +1,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+#ifndef N
 #define N 512
+#endif
 #define TILE_WIDTH 16
 
 // ----------------------------------------
